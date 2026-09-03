@@ -113,11 +113,17 @@ class MTAReceiver:
         async def on_read(uuid: str) -> bytes:
             if uuid.lower() == str(CHAR_STATUS_UUID).lower():
                 logger.info("[BLE] A device is probing our status...")
-                # Return DeviceInfo with our public key
+                # Return DeviceInfo with our public key and real Wi-Fi MAC.
+                # state=0 means "idle/ready to receive" (the phone shows
+                # "device busy" if we advertise state=1); catShare=1 is the
+                # protocol version marker real MTA senders expect.
+                from .wifi_helper import get_wifi_mac
+
                 info = DeviceInfo(
                     state=0,
                     key=self.crypto.get_public_key(),
-                    mac="00:00:00:00:00:00", # Placeholder MAC
+                    mac=get_wifi_mac(),
+                    catshare=1,
                 )
                 return info.to_json().encode("utf-8")
             return b""
@@ -222,23 +228,41 @@ class MTAReceiver:
             close_timeout=10,
             open_timeout=timeout,
         ) as ws:
-            async for raw_msg in ws:
+            status_sent = False
+            while True:
+                try:
+                    raw_msg = await asyncio.wait_for(ws.recv(), timeout=60)
+                except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                    break
+
                 if isinstance(raw_msg, bytes):
                     raw_msg = raw_msg.decode("utf-8")
-                
+
                 msg = WSMessage.parse(raw_msg)
                 if msg is None:
                     continue
-                
+
+                # If we've already sent the OK status, the only message we
+                # still care about is the sender's ACK of it.
+                if status_sent:
+                    if msg.type == "ack" and msg.name.lower() == "status":
+                        logger.info("[WS] Got status ACK: %s", raw_msg)
+                        # The sender runs post-status cleanup (a ~1s delay in
+                        # CatShare) before closing; keep the socket open so it
+                        # can finish, then close gracefully.
+                        await asyncio.sleep(3)
+                        return received_files
+                    continue
+
                 for event, response in protocol.on_ws_message(msg):
                     # Send response if any
                     if response:
                         await ws.send(response.serialize())
-                    
+
                     # Handle events
                     if isinstance(event, VersionNegotiated):
                         pass  # Version negotiated, waiting for send request
-                    
+
                     elif isinstance(event, TextReceived):
                         # Text share - call callback and send OK
                         if self.on_text:
@@ -246,13 +270,13 @@ class MTAReceiver:
                         ok_msg = protocol.send_ok()
                         await ws.send(ok_msg.serialize())
                         return []  # No files for text share
-                    
+
                     elif isinstance(event, SendRequestReceived):
                         # Ask user to accept
                         accepted = self.auto_accept
                         if not accepted and self.on_request:
                             accepted = await self.on_request(event.request)
-                        
+
                         if accepted:
                             accept_event, _ = protocol.accept_transfer()
                             if accept_event:
@@ -261,17 +285,18 @@ class MTAReceiver:
                                     accept_event.download_url,
                                     ssl_context,
                                 )
-                                # Send OK status
+                                # Send OK status and keep the WebSocket open
+                                # until the sender ACKs it (matching CatShare).
                                 ok_msg = protocol.send_ok()
+                                logger.info("[WS] Sending OK status: %s", ok_msg.serialize())
                                 await ws.send(ok_msg.serialize())
-                                await asyncio.sleep(1)  # Give time for ACK
-                                return received_files
+                                status_sent = True
                         else:
                             # Reject
                             reject_msg = protocol.reject_transfer()
                             await ws.send(reject_msg.serialize())
                             return []
-                    
+
                     elif isinstance(event, StatusReceived):
                         # Status from sender (e.g., cancel)
                         if event.status.type == 3:  # User refuse

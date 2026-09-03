@@ -123,6 +123,7 @@ __all__ = [
     "get_crypto_provider",
     "get_ble_provider",
     "get_macos_ble_provider",
+    "get_linux_ble_provider",
     "get_wifi_p2p_provider",
 ]
 
@@ -143,6 +144,12 @@ def get_macos_ble_provider() -> BLEProvider:
     """Get the macOS-specific BLE provider (requires pyobjc)."""
     from .drivers.macos import CoreBluetoothBLEProvider
     return CoreBluetoothBLEProvider()
+
+
+def get_linux_ble_provider() -> BLEProvider:
+    """Get the Linux-specific BLE provider (requires dbus-fast)."""
+    from .drivers.linux import BlueZBLEProvider
+    return BlueZBLEProvider()
 
 
 def get_wifi_p2p_provider() -> WiFiP2PProvider:

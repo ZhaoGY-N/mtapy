@@ -113,7 +113,8 @@ class ReceiverProtocol:
         self.version = PROTOCOL_VERSION
         self.thread_limit = 5
         self._send_request: Optional[SendRequest] = None
-        self._msg_id_counter = 99
+        # CatShare's receiver sends the OK status with message id 99.
+        self._msg_id_counter = 98
 
     def _next_msg_id(self) -> int:
         """Get next message ID for outgoing messages."""

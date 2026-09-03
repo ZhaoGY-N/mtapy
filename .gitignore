@@ -205,3 +205,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Python venv
+.venv/
+
+# mtapy runtime artifacts
+received_files/
+self_test.py
+.remember/
+test_result.txt
