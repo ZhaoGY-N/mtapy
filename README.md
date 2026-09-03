@@ -8,6 +8,60 @@ MTA is used by Xiaomi, OPPO, vivo, OnePlus, Realme, and other Android manufactur
 
 Now your favorite desktop OS joins the alliance! 现在你钟爱的桌面操作系统也加入联盟！
 
+## Linux (Ubuntu) Support 🐧
+
+mtapy can receive files from 互传 (MTA) devices on **Linux** — verified
+end-to-end on **Ubuntu 20.04** with a Xiaomi phone (the phone shows
+「发送成功」and the file arrives intact).
+
+### Requirements
+
+- Ubuntu 20.04+ with **BlueZ** (tested on 5.53) and **NetworkManager**
+- A Bluetooth LE adapter (BLE peripheral mode)
+- A Wi-Fi adapter managed by NetworkManager
+- Python 3.11+ (the code uses PEP 585 type hints)
+
+### Installation
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install "dbus-fast" "bleak>=0.21,<0.23" "websockets>=12" "cryptography>=41,<43"
+```
+
+> Note: bleak 3.x is not compatible with BlueZ 5.53; use 0.22.x.
+
+### Run
+
+```bash
+.venv/bin/python demo_linux.py
+```
+
+On your Android phone: share a file → 互传 → tap the device
+(「未知设备」— see limitations) → the file lands in `received_files/`.
+
+### How it works
+
+1. **Advertise** the MTA BLE service (`00003331-...`) via BlueZ
+2. **GATT server** — CHAR_STATUS (read) + CHAR_P2P (write)
+3. The phone reads our `DeviceInfo` (`state=0` = ready) and writes P2P
+   credentials (SSID/PSK/port) over BLE
+4. We join the phone's WiFi Direct group via NetworkManager (a
+   **BSSID-pinned connection profile**)
+5. WebSocket handshake + HTTPS download of the ZIP archive
+6. Files are extracted into `received_files/`
+
+### Known limitations
+
+- **「未知设备」in the device list**: BlueZ 5.53 only supports 31-byte
+  legacy advertising, which cannot carry the full MTA advertisement
+  (62 bytes). The device works but the name isn't shown. Upgrading to
+  BlueZ ≥ 5.55 (extended advertising) fixes the name.
+- **Wi-Fi join may need a retry**: NetworkManager's scan often misses the
+  phone's freshly-created P2P group; the BSSID-profile fallback usually
+  catches it on a retry.
+- `192.168.49.1` (the P2P group-owner address) is currently hardcoded.
+- Large files are buffered in memory (no streaming to disk yet).
+
 ## Progress
 
 vibing in progress, **not ready** for production use. 本项目当前状态：vibe出来了个demo  🤣
