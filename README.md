@@ -23,12 +23,22 @@ end-to-end on **Ubuntu 20.04** with a Xiaomi phone (the phone shows
 
 ### Installation
 
+From this repo (recommended for the Linux receiver):
+
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install "dbus-fast" "bleak>=0.21,<0.23" "websockets>=12" "cryptography>=41,<43"
+.venv/bin/pip install -e ".[linux]"
 ```
 
-> Note: bleak 3.x is not compatible with BlueZ 5.53; use 0.22.x.
+Or install just the needed packages:
+
+```bash
+.venv/bin/pip install "dbus-fast>=2.0" "bleak>=0.21.0,<0.23" \
+  "websockets>=12" "cryptography>=41,<43"
+```
+
+> Note: bleak 3.x is not compatible with BlueZ 5.53 (it requires the
+> adapter's "Roles" property); use 0.22.x on older BlueZ.
 
 ### Run
 
