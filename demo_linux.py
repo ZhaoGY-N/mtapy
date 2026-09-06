@@ -52,10 +52,14 @@ async def listen_for_transfers(
 
         if auto_connect:
             logger.info("[WIFI] 🤖 Auto-connecting via nmcli...")
-            success = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: connect_to_wifi(p2p.ssid, p2p.psk, p2p.mac),
-            )
+            try:
+                success = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: connect_to_wifi(p2p.ssid, p2p.psk, p2p.mac, p2p.freq),
+                )
+            except Exception as e:
+                logger.error("[WIFI] ❌ connect error: %s", e)
+                success = False
             if success:
                 logger.info("[WIFI] 🚀 Auto-connected! Starting transfer in 2s...")
                 await asyncio.sleep(2.0)

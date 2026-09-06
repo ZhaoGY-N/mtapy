@@ -81,7 +81,8 @@ def get_wifi_mac() -> str:
     return "00:00:00:00:00:00"
 
 
-def connect_to_wifi(ssid: str, password: str, bssid: Optional[str] = None) -> bool:
+def connect_to_wifi(ssid: str, password: str, bssid: Optional[str] = None,
+                    freq: Optional[int] = None) -> bool:
     """
     Connect to a Wi-Fi network.
 
@@ -92,13 +93,15 @@ def connect_to_wifi(ssid: str, password: str, bssid: Optional[str] = None) -> bo
         ssid: Network name (e.g. "DIRECT-XXXXXXXX")
         password: Network password
         bssid: Optional BSSID (for Android P2P groups, the phone's P2P MAC)
+        freq: Optional frequency in MHz of the P2P group (used to detect a
+              same-channel conflict with the current connection)
 
     Returns True if successful.
     """
     if sys.platform == "darwin":
         return _connect_to_wifi_macos(ssid, password)
     elif sys.platform.startswith("linux"):
-        return _connect_to_wifi_linux(ssid, password, bssid)
+        return _connect_to_wifi_linux(ssid, password, bssid, freq)
     else:
         logger.error("[WIFI] ❌ Auto-connect not supported on this platform")
         return False
@@ -189,15 +192,38 @@ def _get_current_connection(device: str) -> Optional[str]:
     return None
 
 
-def _connect_to_wifi_linux(ssid: str, password: str, bssid: Optional[str] = None) -> bool:
+def _current_freq(device: str) -> Optional[int]:
+    """Return the frequency (MHz) the Wi-Fi device is currently on."""
+    try:
+        result = subprocess.run(
+            ["iw", "dev", device, "info"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        for line in result.stdout.splitlines():
+            if "MHz" in line and "channel" in line:
+                m = re.search(r"\((\d+) MHz\)", line)
+                if m:
+                    return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _connect_to_wifi_linux(ssid: str, password: str, bssid: Optional[str] = None,
+                           freq: Optional[int] = None) -> bool:
     """Connect to a Wi-Fi network using nmcli (NetworkManager) on Linux.
 
     The phone's P2P group (DIRECT-XXX) is freshly created when it writes the
-    P2P info over BLE, so it may not yet be in NetworkManager's scan cache.
-    NetworkManager rate-limits scans (~10s interval) and rejects scans that
-    follow too quickly, so we must pace ourselves: one rescan, an 8-second
-    wait for it to complete, then poll.  As a fallback we temporarily
-    disconnect the Wi-Fi device so the adapter does a full-band scan.
+    P2P info over BLE, and NetworkManager's scan cache usually misses it —
+    but a raw ``iw scan`` sees it, so the network *is* there and responds to
+    probes.  The BSSID-pinned profile connect does a fresh directed probe
+    each time, so we retry it quickly back-to-back to catch a responsive
+    window.
+
+    If the phone's group is on the same channel as our current connection,
+    the adapter cannot join it while associated, so we disconnect first.
     """
     if shutil.which("nmcli") is None:
         logger.error("[WIFI] ❌ nmcli not found (is NetworkManager installed?)")
@@ -210,36 +236,38 @@ def _connect_to_wifi_linux(ssid: str, password: str, bssid: Optional[str] = None
     deadline = time.time() + 30
     disconnected = False
 
-    # The BSSID-profile connect is the one that reliably works, but it must
-    # run while the phone's group is still fresh.  Try it first.
-    if _nmcli_profile_connect(ssid, password, bssid):
-        return True
-
-    while time.time() < deadline:
-        # One rescan, then give it time to complete before polling.
-        try:
+    # Same-channel conflict: if the phone's group shares the channel of our
+    # current connection, drop the current connection first so the adapter
+    # can freely probe/join the phone's group.
+    if freq and device:
+        cur = _current_freq(device)
+        if cur is not None and abs(cur - freq) < 20:
+            logger.warning(
+                "[WIFI] P2P 组与当前连接同频道 (%d MHz)，先断开 %s",
+                freq, device,
+            )
             subprocess.run(
-                ["nmcli", "device", "wifi", "rescan"],
+                ["nmcli", "device", "disconnect", device],
                 capture_output=True,
                 text=True,
                 timeout=15,
             )
-        except Exception:
-            pass  # rescan can fail if a scan is already running; ignore
-        time.sleep(8)
+            disconnected = True
 
+    while time.time() < deadline:
+        # BSSID-profile connect: a fresh directed probe each attempt.
+        if _nmcli_profile_connect(ssid, password, bssid, timeout=10):
+            return True
+
+        # Maybe it also showed up in NetworkManager's scan cache now.
         if ssid in _nmcli_wifi_list_ssids():
             if _nmcli_connect(ssid, password, bssid=bssid):
                 return True
 
-        # The BSSID-profile connect again (the group may have become
-        # probe-able by now).
-        if _nmcli_profile_connect(ssid, password, bssid):
-            return True
-
-        # If we're still associated, disconnect so the adapter does a full
-        # scan that can see the freshly-created P2P GO network.
-        if not disconnected and device:
+        # Late fallback: disconnect so the adapter does a full-band scan
+        # (only in the last stretch, to avoid dropping the user's Wi-Fi
+        # needlessly).
+        if not disconnected and device and time.time() > deadline - 12:
             logger.warning("[WIFI] Not visible yet; temporarily disconnecting %s", device)
             subprocess.run(
                 ["nmcli", "device", "disconnect", device],
@@ -270,13 +298,16 @@ def _connect_to_wifi_linux(ssid: str, password: str, bssid: Optional[str] = None
 
 
 def _nmcli_profile_connect(ssid: str, password: str,
-                           bssid: Optional[str] = None) -> bool:
+                           bssid: Optional[str] = None,
+                           timeout: int = 15) -> bool:
     """Connect via a pinned connection profile (BSSID + hidden).
 
     A plain ``nmcli device wifi connect`` relies on NetworkManager's scan
     cache, which often misses the phone's freshly-created P2P GO network.
     Activating a profile with an explicit BSSID and ``hidden yes`` makes
-    NetworkManager probe the BSSID directly.
+    NetworkManager probe the BSSID directly.  ``timeout`` bounds how long
+    we wait for the activation (short, so failures are detected fast and
+    the profile can be retried quickly).
     """
     con_name = "mta-direct"
     # Remove any stale profile first.
@@ -302,12 +333,23 @@ def _nmcli_profile_connect(ssid: str, password: str,
         logger.warning("[WIFI] profile add failed: %s", add.stderr.strip())
         return False
 
-    up = subprocess.run(
-        ["nmcli", "connection", "up", con_name],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    try:
+        up = subprocess.run(
+            ["nmcli", "connection", "up", con_name],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("[WIFI] profile connect timed out after %ss", timeout)
+        subprocess.run(
+            ["nmcli", "connection", "delete", con_name],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return False
+
     if up.returncode == 0:
         logger.info("[WIFI] ✅ Connected to '%s' via BSSID profile", ssid)
         time.sleep(2.0)

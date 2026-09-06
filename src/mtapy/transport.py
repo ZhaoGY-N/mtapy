@@ -1,7 +1,10 @@
 from __future__ import annotations
 import asyncio
-import ssl
 import io
+import os
+import shutil
+import ssl
+import tempfile
 import zipfile
 import urllib.request
 from pathlib import Path
@@ -232,12 +235,17 @@ class MTAReceiver:
             while True:
                 try:
                     raw_msg = await asyncio.wait_for(ws.recv(), timeout=60)
-                except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                except asyncio.TimeoutError:
+                    logger.info("[WS] recv timeout, closing")
+                    break
+                except websockets.ConnectionClosed as e:
+                    logger.info("[WS] connection closed: %s", e)
                     break
 
                 if isinstance(raw_msg, bytes):
                     raw_msg = raw_msg.decode("utf-8")
 
+                logger.info("[WS] << %s", raw_msg)
                 msg = WSMessage.parse(raw_msg)
                 if msg is None:
                     continue
@@ -257,6 +265,7 @@ class MTAReceiver:
                 for event, response in protocol.on_ws_message(msg):
                     # Send response if any
                     if response:
+                        logger.info("[WS] >> %s", response.serialize())
                         await ws.send(response.serialize())
 
                     # Handle events
@@ -280,17 +289,27 @@ class MTAReceiver:
                         if accepted:
                             accept_event, _ = protocol.accept_transfer()
                             if accept_event:
-                                # Download files
+                                # Download files first — this is what matters.
                                 received_files = await self._download_files(
                                     accept_event.download_url,
                                     ssl_context,
                                 )
-                                # Send OK status and keep the WebSocket open
-                                # until the sender ACKs it (matching CatShare).
+                                # Then send OK status.  The Xiaomi sender often
+                                # closes the WebSocket as soon as it finishes
+                                # serving (especially for large files), so the
+                                # status may not get out — but the file is
+                                # already saved regardless.
                                 ok_msg = protocol.send_ok()
                                 logger.info("[WS] Sending OK status: %s", ok_msg.serialize())
-                                await ws.send(ok_msg.serialize())
-                                status_sent = True
+                                try:
+                                    await ws.send(ok_msg.serialize())
+                                    status_sent = True
+                                except websockets.ConnectionClosed:
+                                    logger.warning(
+                                        "[WS] Sender closed before status; "
+                                        "%d file(s) already saved", len(received_files)
+                                    )
+                                    return received_files
                         else:
                             # Reject
                             reject_msg = protocol.reject_transfer()
@@ -309,17 +328,37 @@ class MTAReceiver:
         download_url: str,
         ssl_context: ssl.SSLContext,
     ) -> List[ReceivedFile]:
-        """Download and extract files from ZIP stream."""
-        # Use urllib for HTTPS download (simpler than adding aiohttp)
+        """Download and extract files from a ZIP stream.
+
+        The archive is streamed to a temporary file (constant memory) and
+        then extracted, so arbitrarily large files are handled without
+        buffering everything in RAM.
+        """
         loop = asyncio.get_event_loop()
-        
+
         def do_download():
             req = urllib.request.Request(download_url)
-            with urllib.request.urlopen(req, context=ssl_context) as resp:
-                return resp.read()
-        
-        data = await loop.run_in_executor(None, do_download)
-        return extract_zip_stream(data, self.output_dir)
+            # socket timeout applies to reads too: if the sender stops
+            # sending data for 30s (e.g. the phone app gives up on a very
+            # large transfer), the download aborts instead of hanging.
+            with urllib.request.urlopen(req, context=ssl_context, timeout=30) as resp:
+                tmp = tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".zip", prefix="mtapy_"
+                )
+                try:
+                    shutil.copyfileobj(resp, tmp, length=1024 * 1024)
+                finally:
+                    tmp.close()
+                return tmp.name
+
+        tmp_path = await loop.run_in_executor(None, do_download)
+        try:
+            return extract_zip_file(tmp_path, self.output_dir)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 class MTASender:
@@ -427,46 +466,69 @@ async def create_zip_stream(
         yield chunk
 
 
+def _extract_zip_entries(zf: zipfile.ZipFile, output_dir: Path) -> List[ReceivedFile]:
+    """Extract all entries from an open ZipFile into ``output_dir``."""
+    received = []
+
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+
+        # Get just the filename (strip directory prefix)
+        name = Path(info.filename).name
+        out_path = output_dir / name
+
+        # Handle name conflicts
+        counter = 1
+        while out_path.exists():
+            stem = out_path.stem
+            suffix = out_path.suffix
+            out_path = output_dir / f"{stem}_{counter}{suffix}"
+            counter += 1
+
+        with zf.open(info) as src, open(out_path, "wb") as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+
+        received.append(ReceivedFile(
+            name=name,
+            path=out_path,
+            size=info.file_size,
+        ))
+
+    return received
+
+
 def extract_zip_stream(
     data: bytes,
     output_dir: Path,
 ) -> List[ReceivedFile]:
     """
-    Extract files from a ZIP stream.
-    
+    Extract files from a ZIP stream (in-memory).
+
     Args:
         data: ZIP file data
         output_dir: Directory to extract to
-        
+
     Returns:
         List of extracted files.
     """
-    received = []
-    
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            
-            # Get just the filename (strip directory prefix)
-            name = Path(info.filename).name
-            out_path = output_dir / name
-            
-            # Handle name conflicts
-            counter = 1
-            while out_path.exists():
-                stem = out_path.stem
-                suffix = out_path.suffix
-                out_path = output_dir / f"{stem}_{counter}{suffix}"
-                counter += 1
-            
-            with zf.open(info) as src, open(out_path, "wb") as dst:
-                dst.write(src.read())
-            
-            received.append(ReceivedFile(
-                name=name,
-                path=out_path,
-                size=info.file_size,
-            ))
-    
-    return received
+        return _extract_zip_entries(zf, output_dir)
+
+
+def extract_zip_file(
+    zip_path: Path,
+    output_dir: Path,
+) -> List[ReceivedFile]:
+    """
+    Extract files from a ZIP file on disk.
+
+    Args:
+        zip_path: Path to the ZIP file
+        output_dir: Directory to extract to
+
+    Returns:
+        List of extracted files.
+    """
+    with zipfile.ZipFile(zip_path) as zf:
+        return _extract_zip_entries(zf, output_dir)

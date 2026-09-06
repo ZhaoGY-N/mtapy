@@ -47,6 +47,7 @@ class P2pInfo:
     id: Optional[str] = None
     key: Optional[str] = None
     catshare: Optional[int] = None
+    freq: Optional[int] = None  # P2P group frequency in MHz (e.g. 5745)
 
     def to_json(self) -> str:
         """Serialize to JSON string."""
@@ -62,6 +63,8 @@ class P2pInfo:
             d["key"] = self.key
         if self.catshare is not None:
             d["catShare"] = self.catshare
+        if self.freq is not None:
+            d["freq"] = self.freq
         return json.dumps(d)
 
     @classmethod
@@ -76,6 +79,7 @@ class P2pInfo:
             id=d.get("id"),
             key=d.get("key"),
             catshare=d.get("catShare"),
+            freq=d.get("freq"),
         )
 
 

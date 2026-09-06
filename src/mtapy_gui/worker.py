@@ -105,9 +105,14 @@ class ReceiverWorker(QObject):
         async def on_p2p(p2p: P2pInfo) -> None:
             self.p2p.emit(p2p.ssid, p2p.psk, p2p.port)
             self.status.emit(f"[WIFI] 连接 {p2p.ssid} ...")
-            success = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: connect_to_wifi(p2p.ssid, p2p.psk, p2p.mac)
-            )
+            try:
+                success = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: connect_to_wifi(p2p.ssid, p2p.psk, p2p.mac, p2p.freq),
+                )
+            except Exception as e:
+                self.error.emit(f"[WIFI] 连接异常: {e}")
+                success = False
             if success:
                 self.status.emit("[WIFI] 已连接，等待传输 ...")
                 await asyncio.sleep(2.0)
