@@ -40,12 +40,16 @@ linux = [
     # bleak 3.x is not compatible with BlueZ 5.53 (adapter "Roles" property)
     "bleak>=0.21.0,<0.23",
 ]
+gui = [
+    "PySide6>=6.5",
+]
 macos = [
     "pyobjc-framework-CoreBluetooth>=9.0",
 ]
 all = [
     "bleak>=0.21.0",
     "dbus-fast>=2.0",
+    "PySide6>=6.5",
 ]
 dev = [
     "pytest>=7.0.0",

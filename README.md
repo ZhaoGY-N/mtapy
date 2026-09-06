@@ -72,6 +72,21 @@ On your Android phone: share a file → 互传 → tap the device
 - `192.168.49.1` (the P2P group-owner address) is currently hardcoded.
 - Large files are buffered in memory (no streaming to disk yet).
 
+### GUI (Qt)
+
+A PySide6 desktop front-end is included under `src/mtapy_gui/`:
+
+```bash
+.venv/bin/pip install -e ".[gui]"
+.venv/bin/python gui.py
+```
+
+It provides:
+- Start/stop the receiver (advertising + GATT server)
+- Device name, save directory and auto-accept settings
+- Live status and a list of received files (double-click to open)
+- System tray icon with notifications
+
 ## Progress
 
 vibing in progress, **not ready** for production use. 本项目当前状态：vibe出来了个demo  🤣
