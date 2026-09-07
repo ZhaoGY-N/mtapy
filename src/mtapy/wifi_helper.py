@@ -10,6 +10,10 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Track the network we took over so restore_wifi() can bring it back even
+# when called without arguments from a different layer (e.g. demo/worker).
+_TAKEOVER_STATE = {"device": None, "connection": None}
+
 
 def get_wifi_interface() -> str:
     """
@@ -328,7 +332,7 @@ def _connect_wifi_wpasupplicant(ssid: str, password: str,
 
 
 def _find_wifi_device() -> Optional[str]:
-    """Return any Wi-Fi device, regardless of connection state."""
+    """Return any Wi-Fi device, regardless of connection/managed state."""
     try:
         result = subprocess.run(
             ["nmcli", "-t", "-f", "DEVICE,TYPE", "device", "status"],
@@ -347,8 +351,16 @@ def _find_wifi_device() -> Optional[str]:
 
 def restore_wifi(device: Optional[str] = None,
                  prev_conn: Optional[str] = None) -> None:
-    """Restore NetworkManager management after a wpa_supplicant session."""
-    device = device or _find_wifi_device()
+    """Restore NetworkManager management after a wpa_supplicant session.
+
+    Uses the takeover state recorded when wpa_supplicant took over the
+    device, so it works even when called without arguments from another
+    layer.
+    """
+    global _TAKEOVER_STATE
+    device = device or _TAKEOVER_STATE["device"] or _find_wifi_device()
+    prev_conn = prev_conn or _TAKEOVER_STATE["connection"]
+    _TAKEOVER_STATE.update(device=None, connection=None)
     if not device:
         return
     _wpa_terminate(device)
@@ -369,7 +381,7 @@ def restore_wifi(device: Optional[str] = None,
     )
     if prev_conn:
         # Retry the reconnect briefly (NM can miss it right after a rescan).
-        for _ in range(3):
+        for _ in range(4):
             time.sleep(2)
             result = subprocess.run(
                 ["nmcli", "connection", "up", prev_conn],
@@ -425,6 +437,9 @@ def _connect_to_wifi_linux(ssid: str, password: str, bssid: Optional[str] = None
     # Fast path: wpa_supplicant directly (needs passwordless sudo).
     if device and _sudo_available():
         logger.info("[WIFI] Trying wpa_supplicant (fast path)...")
+        # Remember what we're taking over so restore_wifi() can bring it back.
+        global _TAKEOVER_STATE
+        _TAKEOVER_STATE.update(device=device, connection=prev_conn)
         if _connect_wifi_wpasupplicant(ssid, password, bssid, device, freq):
             return True
         logger.warning("[WIFI] wpa_supplicant failed; falling back to nmcli")
