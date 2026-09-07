@@ -207,12 +207,26 @@ def _sudo_available() -> bool:
         return False
 
 
+def _wpa_terminate(device: str) -> None:
+    """Gracefully stop our wpa_supplicant on ``device`` (no pkill).
+
+    Uses the dedicated mtapy control directory so we only ever stop the
+    instance we started (NetworkManager's dbus-global instance uses a
+    different socket and is left untouched).
+    """
+    subprocess.run(
+        ["sudo", "wpa_cli", "-p", "/run/mtapy_wpa", "-i", device, "terminate"],
+        capture_output=True, text=True, timeout=15,
+    )
+    time.sleep(1)
+
+
 def _connect_wifi_wpasupplicant(ssid: str, password: str,
                                 bssid: Optional[str], device: str) -> bool:
     """Connect using wpa_supplicant directly (fast, bypasses NM's scan).
 
-    Requires passwordless sudo for wpa_supplicant/dhclient/wpa_cli/pkill
-    (see the sudoers setup in the README).
+    Requires passwordless sudo for wpa_supplicant/dhclient/wpa_cli
+    (see scripts/setup_mtapy_sudoers.sh).
     """
     config = f'network={{\n    ssid="{ssid}"\n    psk="{password}"\n    key_mgmt=WPA-PSK\n'
     if bssid:
@@ -227,23 +241,26 @@ def _connect_wifi_wpasupplicant(ssid: str, password: str,
     )
     time.sleep(1)
 
-    # Kill any leftover wpa_supplicant on the device.
+    # Stop any leftover instance of ours on the device.
+    _wpa_terminate(device)
+    # Ensure our dedicated ctrl directory exists (sudo, since /run is root-owned).
     subprocess.run(
-        ["sudo", "pkill", "-f", f"wpa_supplicant.*{device}"],
+        ["sudo", "mkdir", "-p", "/run/mtapy_wpa"],
         capture_output=True, text=True, timeout=15,
     )
-    time.sleep(1)
 
-    # Start our own wpa_supplicant with the DIRECT network.
+    # Start our own wpa_supplicant with the DIRECT network, bound to the
+    # mtapy control directory so terminate/reconnect only touch our instance.
     subprocess.run(
-        ["sudo", "wpa_supplicant", "-B", "-i", device, "-c", "/tmp/mtapy_wpa.conf"],
+        ["sudo", "wpa_supplicant", "-B", "-i", device,
+         "-c", "/tmp/mtapy_wpa.conf", "-C", "/run/mtapy_wpa"],
         capture_output=True, text=True, timeout=15,
     )
 
     # Wait for the WPA handshake to complete.
     for _ in range(30):
         status = subprocess.run(
-            ["sudo", "wpa_cli", "-i", device, "status"],
+            ["sudo", "wpa_cli", "-p", "/run/mtapy_wpa", "-i", device, "status"],
             capture_output=True, text=True, timeout=5,
         )
         if "wpa_state=COMPLETED" in status.stdout:
@@ -286,10 +303,7 @@ def restore_wifi(device: Optional[str] = None,
     device = device or _find_wifi_device()
     if not device:
         return
-    subprocess.run(
-        ["sudo", "pkill", "-f", f"wpa_supplicant.*{device}"],
-        capture_output=True, text=True, timeout=15,
-    )
+    _wpa_terminate(device)
     subprocess.run(
         ["sudo", "dhclient", "-r", device],
         capture_output=True, text=True, timeout=15,
