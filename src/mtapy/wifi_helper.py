@@ -241,20 +241,32 @@ def _connect_wifi_wpasupplicant(ssid: str, password: str,
                                 freq: Optional[int] = None) -> bool:
     """Connect using wpa_supplicant directly (fast, bypasses NM's scan).
 
-    We start wpa_supplicant with an *empty* config (which scans fine — a
-    config preloaded with the DIRECT network got stuck in SCANNING), then
-    drive the connection through wpa_cli: rescan, add_network with the
-    phone's SSID/PSK/BSSID, and select_network.
+    Key insight (verified on this machine): if the adapter is still
+    associated with its current AP, wpa_supplicant gets stuck in SCANNING
+    and never associates.  So we FIRST disconnect (while NM still manages
+    the device), then hand it to our own wpa_supplicant with the phone's
+    network preloaded — it associates in ~2s.
 
     Requires passwordless sudo for wpa_supplicant/wpa_cli/dhclient
     (see scripts/setup_mtapy_sudoers.sh).
     """
-    # Empty config: just a dedicated ctrl dir.
-    Path("/tmp/mtapy_wpa.conf").write_text(
-        "ctrl_interface=/run/mtapy_wpa\nupdate_config=1\n"
-    )
+    # Preload the DIRECT network into the config.
+    config = f'ctrl_interface=/run/mtapy_wpa\nupdate_config=1\n\n' \
+             f'network={{\n    ssid="{ssid}"\n    psk="{password}"\n' \
+             f'    key_mgmt=WPA-PSK\n    scan_ssid=1\n'
+    if bssid:
+        config += f'    bssid={bssid}\n'
+    config += '}\n'
+    Path("/tmp/mtapy_wpa.conf").write_text(config)
 
-    # Stop NetworkManager managing the device (works without root).
+    # Disassociate while NM still manages the device, then stop NM
+    # management.  `managed no` alone leaves the adapter associated with the
+    # old AP, which keeps wpa_supplicant stuck in SCANNING.
+    subprocess.run(
+        ["nmcli", "device", "disconnect", device],
+        capture_output=True, text=True, timeout=15,
+    )
+    time.sleep(1)
     subprocess.run(
         ["nmcli", "device", "set", device, "managed", "no"],
         capture_output=True, text=True, timeout=15,
@@ -278,35 +290,12 @@ def _connect_wifi_wpasupplicant(ssid: str, password: str,
     if proc.returncode != 0:
         logger.error("[WIFI] wpa_supplicant start failed: %s", proc.stderr.strip())
         return False
-    time.sleep(2)
-
-    # Kick off a scan so the phone's group is in the BSS list.
-    _wpa_cli(device, "scan")
-
-    # Add the network dynamically (no ssid preloaded in the config).
-    net_id = _wpa_cli(device, "add_network").strip()
-    if not net_id.isdigit():
-        logger.error("[WIFI] add_network failed: %r", net_id)
-        return False
-    _wpa_cli(device, "set_network", net_id, "ssid", f'"{ssid}"')
-    _wpa_cli(device, "set_network", net_id, "psk", f'"{password}"')
-    _wpa_cli(device, "set_network", net_id, "key_mgmt", "WPA-PSK")
-    _wpa_cli(device, "set_network", net_id, "scan_ssid", "1")
-    if bssid:
-        _wpa_cli(device, "set_network", net_id, "bssid", bssid)
-    _wpa_cli(device, "enable_network", net_id)
-    _wpa_cli(device, "select_network", net_id)
 
     # Wait for the WPA handshake to complete.
     for attempt in range(30):
-        status = subprocess.run(
-            ["sudo", "wpa_cli", "-p", "/run/mtapy_wpa", "-i", device, "status"],
-            capture_output=True, text=True, timeout=5,
-        )
-        stdout = status.stdout
+        stdout = _wpa_cli(device, "status")
         if "wpa_state=COMPLETED" in stdout:
             break
-        # Log the current state every few tries for diagnosis.
         if attempt % 5 == 0:
             state_line = next(
                 (l for l in stdout.splitlines() if "wpa_state" in l or "ssid" in l),
@@ -316,17 +305,10 @@ def _connect_wifi_wpasupplicant(ssid: str, password: str,
         time.sleep(0.5)
     else:
         logger.error("[WIFI] wpa_supplicant did not reach COMPLETED")
-        # Dump last status + scan results for diagnosis.
-        final = subprocess.run(
-            ["sudo", "wpa_cli", "-p", "/run/mtapy_wpa", "-i", device, "status"],
-            capture_output=True, text=True, timeout=5,
-        )
-        logger.error("[WIFI] final wpa_cli status:\n%s", final.stdout)
-        scan = subprocess.run(
-            ["sudo", "wpa_cli", "-p", "/run/mtapy_wpa", "-i", device, "scan_results"],
-            capture_output=True, text=True, timeout=5,
-        )
-        logger.error("[WIFI] scan_results:\n%s", scan.stdout)
+        final = _wpa_cli(device, "status")
+        logger.error("[WIFI] final wpa_cli status:\n%s", final)
+        scan = _wpa_cli(device, "scan_results")
+        logger.error("[WIFI] scan_results:\n%s", scan)
         # Hand the device back to NetworkManager so the nmcli fallback works.
         _wpa_terminate(device)
         subprocess.run(
@@ -378,11 +360,25 @@ def restore_wifi(device: Optional[str] = None,
         ["nmcli", "device", "set", device, "managed", "yes"],
         capture_output=True, text=True, timeout=15,
     )
+    time.sleep(2)
+    # The previous connection's network may be stale in NM's scan cache after
+    # the wpa_supplicant session; rescan so a reconnect can find it.
+    subprocess.run(
+        ["nmcli", "device", "wifi", "rescan"],
+        capture_output=True, text=True, timeout=15,
+    )
     if prev_conn:
-        subprocess.run(
-            ["nmcli", "connection", "up", prev_conn],
-            capture_output=True, text=True, timeout=30,
-        )
+        # Retry the reconnect briefly (NM can miss it right after a rescan).
+        for _ in range(3):
+            time.sleep(2)
+            result = subprocess.run(
+                ["nmcli", "connection", "up", prev_conn],
+                capture_output=True, text=True, timeout=20,
+            )
+            if result.returncode == 0:
+                break
+            logger.warning("[WIFI] restore attempt failed: %s",
+                           (result.stderr or result.stdout).strip())
 
 
 def _current_freq(device: str) -> Optional[int]:
