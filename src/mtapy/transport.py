@@ -5,6 +5,7 @@ import os
 import shutil
 import ssl
 import tempfile
+import time
 import zipfile
 import urllib.request
 from pathlib import Path
@@ -335,20 +336,37 @@ class MTAReceiver:
         buffering everything in RAM.
         """
         loop = asyncio.get_event_loop()
+        dl_start = time.monotonic()
 
         def do_download():
             req = urllib.request.Request(download_url)
-            # socket timeout applies to reads too: if the sender stops
-            # sending data for 30s (e.g. the phone app gives up on a very
-            # large transfer), the download aborts instead of hanging.
-            with urllib.request.urlopen(req, context=ssl_context, timeout=30) as resp:
+            # Reads block up to 60s waiting for data; a sender that stops
+            # streaming (phone app giving up on a huge file) aborts here.
+            with urllib.request.urlopen(req, context=ssl_context, timeout=60) as resp:
                 tmp = tempfile.NamedTemporaryFile(
                     delete=False, suffix=".zip", prefix="mtapy_"
                 )
+                total = 0
+                last_log = time.monotonic()
                 try:
-                    shutil.copyfileobj(resp, tmp, length=1024 * 1024)
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        tmp.write(chunk)
+                        total += len(chunk)
+                        now = time.monotonic()
+                        if now - last_log >= 5:
+                            elapsed = max(now - dl_start, 0.01)
+                            logger.info(
+                                "[DL] %d MB downloaded (%.1f MB/s)",
+                                total // (1024 * 1024),
+                                (total / (1024 * 1024)) / elapsed,
+                            )
+                            last_log = now
                 finally:
                     tmp.close()
+                logger.info("[DL] download complete: %d bytes", total)
                 return tmp.name
 
         tmp_path = await loop.run_in_executor(None, do_download)

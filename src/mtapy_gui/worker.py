@@ -1,6 +1,7 @@
 """MTA receiver worker: runs the asyncio receiver in a background QThread."""
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -9,6 +10,21 @@ from PySide6.QtCore import QObject, QThread, Signal
 from mtapy import MTAReceiver, SendRequest, P2pInfo
 from mtapy.drivers.linux import BlueZBLEProvider
 from mtapy.wifi_helper import connect_to_wifi, restore_wifi
+
+# File log so a stalled/hung transfer can be diagnosed later (the GUI has no
+# scrollback of its own once the worker blocks).
+_logger = logging.getLogger("mtapy_gui.worker")
+_logger.setLevel(logging.INFO)
+if not _logger.handlers:
+    _h = logging.FileHandler("/tmp/mtapy_gui.log")
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _logger.addHandler(_h)
+    # Also capture mtapy.transport's [DL] progress so the download stall
+    # point is visible in the same file.
+    for _name in ("mtapy.transport", "mtapy.wifi_helper", "mtapy"):
+        _mlog = logging.getLogger(_name)
+        _mlog.setLevel(logging.INFO)
+        _mlog.addHandler(_h)
 
 
 class ReceiverWorker(QObject):
@@ -94,6 +110,10 @@ class ReceiverWorker(QObject):
         output_dir.mkdir(parents=True, exist_ok=True)
 
         async def on_request(request: SendRequest) -> bool:
+            _logger.info(
+                "[RECV] %s → %s (%d bytes)",
+                request.sender_name, request.file_name, request.total_size,
+            )
             self.transfer_started.emit(
                 request.sender_name, request.file_name, request.total_size
             )
@@ -103,6 +123,7 @@ class ReceiverWorker(QObject):
             self.status.emit(f"[TEXT] {text}")
 
         async def on_p2p(p2p: P2pInfo) -> None:
+            _logger.info("[P2P] SSID=%s port=%s freq=%s", p2p.ssid, p2p.port, p2p.freq)
             self.p2p.emit(p2p.ssid, p2p.psk, p2p.port)
             self.status.emit(f"[WIFI] 连接 {p2p.ssid} ...")
             try:
@@ -112,8 +133,10 @@ class ReceiverWorker(QObject):
                 )
             except Exception as e:
                 self.error.emit(f"[WIFI] 连接异常: {e}")
+                _logger.error("[WIFI] connect error: %s", e)
                 success = False
             if success:
+                _logger.info("[WIFI] connected to %s", p2p.ssid)
                 self.status.emit("[WIFI] 已连接，等待传输 ...")
                 await asyncio.sleep(2.0)
             else:
