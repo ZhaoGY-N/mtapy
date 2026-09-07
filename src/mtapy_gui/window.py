@@ -4,8 +4,9 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QFileDialog,
     QGroupBox,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -21,20 +23,42 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .worker import ReceiverWorker
+from . import theme
+from .steps import StepIndicator
+from .worker import (
+    ReceiverWorker,
+    STAGE_IDLE,
+    STAGE_LISTENING,
+    STAGE_P2P,
+    STAGE_WIFI,
+    STAGE_TRANSFER,
+    STAGE_DONE,
+    STAGE_NAMES,
+)
+
+# Order shown in the step indicator.
+_STEPS = [
+    (STAGE_LISTENING, "广播监听"),
+    (STAGE_P2P, "配对"),
+    (STAGE_WIFI, "Wi-Fi"),
+    (STAGE_TRANSFER, "传输"),
+    (STAGE_DONE, "完成"),
+]
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("mtapy 互传接收端")
-        self.resize(640, 480)
+        self.resize(680, 540)
 
+        self.dark = False
         self.worker = ReceiverWorker()
         self._connect_worker_signals()
 
         self._build_ui()
         self._build_tray()
+        self._apply_theme()
 
     # ------------------------------------------------------------------
     # UI
@@ -42,7 +66,37 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("central")
         layout = QVBoxLayout(central)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(12)
+
+        # --- Title ---
+        title_row = QHBoxLayout()
+        title = QLabel("mtapy")
+        title.setStyleSheet("font-size: 18px; font-weight: 700;")
+        self.stage_hint = QLabel("等待开始")
+        self.stage_hint.setObjectName("dim")
+        title_row.addWidget(title)
+        title_row.addStretch()
+        title_row.addWidget(self.stage_hint)
+        layout.addLayout(title_row)
+
+        # --- Step indicator + download progress ---
+        self.steps = StepIndicator(_STEPS)
+        self.steps.set_current_step(STAGE_IDLE)
+        layout.addWidget(self.steps)
+
+        prog_row = QHBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_label = QLabel("")
+        self.progress_label.setObjectName("dim")
+        prog_row.addWidget(self.progress_bar, 1)
+        prog_row.addWidget(self.progress_label)
+        layout.addLayout(prog_row)
 
         # --- Settings group ---
         settings = QGroupBox("设置")
@@ -51,7 +105,7 @@ class MainWindow(QMainWindow):
         name_row = QHBoxLayout()
         name_row.addWidget(QLabel("设备名:"))
         self.name_edit = QLineEdit("Ubuntu-PC")
-        name_row.addWidget(self.name_edit)
+        name_row.addWidget(self.name_edit, 1)
         s_layout.addLayout(name_row)
 
         dir_row = QHBoxLayout()
@@ -64,7 +118,7 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(self.dir_btn)
         s_layout.addLayout(dir_row)
 
-        self.auto_accept_check = QCheckBox("自动接受文件")
+        self.auto_accept_check = QCheckBox("自动接受文件（不询问）")
         self.auto_accept_check.setChecked(True)
         s_layout.addWidget(self.auto_accept_check)
 
@@ -73,17 +127,18 @@ class MainWindow(QMainWindow):
         # --- Control buttons ---
         btn_row = QHBoxLayout()
         self.start_btn = QPushButton("开始监听")
+        self.start_btn.setObjectName("primary")
         self.start_btn.clicked.connect(self._on_start)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.clicked.connect(self._on_stop)
         self.stop_btn.setEnabled(False)
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.stop_btn)
+        btn_row.addStretch()
         layout.addLayout(btn_row)
 
         # --- Status ---
         self.status_label = QLabel("未启动")
-        self.status_label.setStyleSheet("font-weight: bold;")
         layout.addWidget(self.status_label)
 
         # --- Files table ---
@@ -92,18 +147,38 @@ class MainWindow(QMainWindow):
         self.files_table = QTableWidget(0, 3)
         self.files_table.setHorizontalHeaderLabels(["文件名", "大小", "时间"])
         self.files_table.horizontalHeader().setStretchLastSection(True)
-        self.files_table.setColumnWidth(0, 360)
+        self.files_table.setColumnWidth(0, 400)
         self.files_table.setColumnWidth(1, 90)
-        self.files_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.files_table.setAlternatingRowColors(True)
+        self.files_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.files_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.files_table.cellDoubleClicked.connect(self._open_file)
         f_layout.addWidget(self.files_table)
         layout.addWidget(files_group, 1)
 
         self.setCentralWidget(central)
 
+    def _apply_theme(self) -> None:
+        """Detect dark/light and apply the matching stylesheet."""
+        self.dark = theme.is_dark_mode()
+        style = theme.build_stylesheet(self.dark)
+        # Apply to the app instance (not just this window) so dialogs match.
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.instance().setStyleSheet(style)
+        self.steps.set_dark(self.dark)
+        self._restyle_buttons()
+
     def _build_tray(self) -> None:
         self.tray = _TrayIcon(self)
         self.tray.show()
+
+    def _restyle_buttons(self) -> None:
+        c = theme.DARK if self.dark else theme.LIGHT
+        self.start_btn.setStyleSheet(
+            f"background-color: {c['accent']}; color: #fff; border: none;"
+            f"border-radius: 8px; padding: 8px 18px; font-weight: 600;"
+        )
 
     # ------------------------------------------------------------------
     # Worker signal handlers
@@ -116,13 +191,16 @@ class MainWindow(QMainWindow):
         self.worker.p2p.connect(self._on_p2p)
         self.worker.error.connect(self._on_error)
         self.worker.finished.connect(self._on_finished)
+        self.worker.stage.connect(self._on_stage)
+        self.worker.transfer_requested.connect(self._on_transfer_requested)
+        self.worker.progress.connect(self._on_progress)
 
     def _on_status(self, message: str) -> None:
         self.status_label.setText(message)
         self.tray.showMessage("mtapy", message, QIcon(), 3000)
 
     def _on_transfer_started(self, sender: str, filename: str, size: int) -> None:
-        self.status_label.setText(f"📥 {sender} → {filename} ({size} bytes)")
+        self.status_label.setText(f"📥 {sender} → {filename} ({_fmt_size(size)})")
 
     def _on_file_received(self, name: str, path: str, size: int) -> None:
         row = self.files_table.rowCount()
@@ -134,7 +212,7 @@ class MainWindow(QMainWindow):
         self.tray.showMessage("收到文件", f"{name} ({_fmt_size(size)})", QIcon(), 5000)
 
     def _on_p2p(self, ssid: str, psk: str, port: int) -> None:
-        self.status_label.setText(f"📶 收到 P2P 信息：{ssid}")
+        self.stage_hint.setText(f"已配对 {ssid}")
 
     def _on_error(self, message: str) -> None:
         self.status_label.setText(f"❌ {message}")
@@ -144,6 +222,42 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.status_label.setText("已停止")
+
+    def _on_stage(self, stage_id: int, label: str) -> None:
+        self.steps.set_current_step(stage_id)
+        if stage_id != STAGE_TRANSFER:
+            self.stage_hint.setText(STAGE_NAMES.get(stage_id, label))
+
+    def _on_transfer_requested(self, sender: str, filename: str, size: int) -> None:
+        """Ask the user whether to accept an incoming transfer."""
+        self.status_label.setText(f"📥 {sender} 想发送 {filename} ...")
+        box = QMessageBox(self)
+        box.setWindowTitle("接收文件")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"**{sender}** 想发送一个文件")
+        box.setInformativeText(
+            f"文件名：{filename}\n大小：{_fmt_size(size)}\n是否接收？"
+        )
+        accept_btn = box.addButton("接收", QMessageBox.ButtonRole.AcceptRole)
+        reject_btn = box.addButton("拒绝", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(accept_btn)
+        box.exec()
+        accepted = box.clickedButton() is accept_btn
+        self.worker.set_decision(accepted)
+        self.status_label.setText("已接收，开始下载 ..." if accepted else "已拒绝传输")
+
+    def _on_progress(self, received: int, total: int) -> None:
+        if total and total > 0:
+            pct = min(int(received * 100 / total), 100)
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(pct)
+            self.progress_label.setText(
+                f"{_fmt_size(received)} / {_fmt_size(total)}"
+            )
+        else:
+            # Unknown total → indeterminate.
+            self.progress_bar.setRange(0, 0)
+            self.progress_label.setText(_fmt_size(received))
 
     # ------------------------------------------------------------------
     # Actions
@@ -160,6 +274,8 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.status_label.setText("启动中 ...")
+        self.progress_bar.setRange(0, 0)  # indeterminate while starting
+        self.progress_label.setText("")
 
     def _on_stop(self) -> None:
         self.worker.stop()
@@ -188,9 +304,9 @@ class MainWindow(QMainWindow):
                 self,
                 "退出",
                 "接收端仍在运行，确定退出吗？",
-                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-            if reply != QMessageBox.Yes:
+            if reply != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
             self.worker.stop()

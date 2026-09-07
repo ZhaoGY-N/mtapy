@@ -61,25 +61,29 @@ class MTAReceiver:
         output_dir: Path,
         on_request: Optional[Callable[[SendRequest], Awaitable[bool]]] = None,
         on_text: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
         auto_accept: bool = False,
         crypto_provider: Optional[CryptoProvider] = None,
     ):
         """
         Initialize receiver.
-        
+
         Args:
             output_dir: Directory to save received files
             on_request: Async callback to accept/reject transfers (return True to accept)
             on_text: Async callback for text shares
+            on_progress: Sync callback (downloaded_bytes, total_bytes) called during download.
+                        Runs in a worker thread — do not touch the GUI directly.
             auto_accept: If True, automatically accept all transfers
             crypto_provider: Optional crypto provider for encryption
         """
         self.output_dir = output_dir
         self.on_request = on_request
         self.on_text = on_text
+        self.on_progress = on_progress
         self.auto_accept = auto_accept
         self.crypto = crypto_provider or get_default_crypto_provider()
-        
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     async def listen(
@@ -343,11 +347,17 @@ class MTAReceiver:
             # Reads block up to 60s waiting for data; a sender that stops
             # streaming (phone app giving up on a huge file) aborts here.
             with urllib.request.urlopen(req, context=ssl_context, timeout=60) as resp:
+                # Total archive size (may be absent on chunked responses).
+                try:
+                    content_length = int(resp.headers.get("Content-Length", 0) or 0)
+                except (ValueError, TypeError):
+                    content_length = 0
                 tmp = tempfile.NamedTemporaryFile(
                     delete=False, suffix=".zip", prefix="mtapy_"
                 )
                 total = 0
                 last_log = time.monotonic()
+                on_progress = self.on_progress
                 try:
                     while True:
                         chunk = resp.read(1024 * 1024)
@@ -355,6 +365,8 @@ class MTAReceiver:
                             break
                         tmp.write(chunk)
                         total += len(chunk)
+                        if on_progress is not None:
+                            on_progress(total, content_length)
                         now = time.monotonic()
                         if now - last_log >= 5:
                             elapsed = max(now - dl_start, 0.01)

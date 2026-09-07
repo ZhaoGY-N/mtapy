@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +11,23 @@ from PySide6.QtCore import QObject, QThread, Signal
 from mtapy import MTAReceiver, SendRequest, P2pInfo
 from mtapy.drivers.linux import BlueZBLEProvider
 from mtapy.wifi_helper import connect_to_wifi, restore_wifi
+
+# Transfer pipeline stages (shared with the GUI's step indicator).
+STAGE_IDLE = 0       # stopped / not listening
+STAGE_LISTENING = 1  # advertising + GATT ready, waiting for a phone
+STAGE_P2P = 2        # P2P credentials received, joining WiFi
+STAGE_WIFI = 3       # connected to the phone's group, waiting for data
+STAGE_TRANSFER = 4   # transfer in progress (download)
+STAGE_DONE = 5       # session finished
+
+STAGE_NAMES = {
+    STAGE_IDLE: "待机",
+    STAGE_LISTENING: "广播监听",
+    STAGE_P2P: "配对",
+    STAGE_WIFI: "Wi-Fi 连接",
+    STAGE_TRANSFER: "传输中",
+    STAGE_DONE: "完成",
+}
 
 # File log so a stalled/hung transfer can be diagnosed later (the GUI has no
 # scrollback of its own once the worker blocks).
@@ -45,6 +63,13 @@ class ReceiverWorker(QObject):
     error = Signal(str)
     finished = Signal()
 
+    # Pipeline stage: (stage_id, label)
+    stage = Signal(int, str)
+    # Ask the GUI to accept/reject an incoming transfer: (sender, filename, size)
+    transfer_requested = Signal(str, str, 'qlonglong')
+    # Download progress: (downloaded_bytes, total_bytes)
+    progress = Signal('qlonglong', 'qlonglong')
+
     def __init__(self) -> None:
         super().__init__()
         self._thread = QThread()
@@ -57,6 +82,11 @@ class ReceiverWorker(QObject):
         self._device_name = "Ubuntu-PC"
         self._output_dir = str(Path.home() / "Downloads")
         self._auto_accept = True
+
+        # Accept/reject decision state, written by the GUI thread (via
+        # set_decision) and polled by the asyncio worker thread.
+        self._decision_lock = threading.Lock()
+        self._pending_decision: Optional[bool] = None
 
     # ------------------------------------------------------------------
     # Public API (called from the GUI thread)
@@ -84,6 +114,11 @@ class ReceiverWorker(QObject):
     def is_running(self) -> bool:
         return self._running
 
+    def set_decision(self, accept: bool) -> None:
+        """Called from the GUI thread to answer a pending transfer request."""
+        with self._decision_lock:
+            self._pending_decision = accept
+
     # ------------------------------------------------------------------
     # Thread body
     # ------------------------------------------------------------------
@@ -108,16 +143,40 @@ class ReceiverWorker(QObject):
         ble = BlueZBLEProvider()
         output_dir = Path(self._output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        loop = asyncio.get_event_loop()
+
+        def report_progress(received: int, total: int) -> None:
+            # Runs in the download executor thread — hop back to the Qt
+            # thread via the signal (thread-safe).
+            self.progress.emit(received, total)
 
         async def on_request(request: SendRequest) -> bool:
             _logger.info(
                 "[RECV] %s → %s (%d bytes)",
                 request.sender_name, request.file_name, request.total_size,
             )
+            self.stage.emit(STAGE_TRANSFER, STAGE_NAMES[STAGE_TRANSFER])
             self.transfer_started.emit(
                 request.sender_name, request.file_name, request.total_size
             )
-            return self._auto_accept
+            if self._auto_accept:
+                return True
+            # Ask the GUI for a decision; poll until the user answers
+            # (or 60s timeout → reject).
+            with self._decision_lock:
+                self._pending_decision = None
+            self.transfer_requested.emit(
+                request.sender_name, request.file_name, request.total_size
+            )
+            deadline = loop.time() + 60
+            while loop.time() < deadline:
+                with self._decision_lock:
+                    decision = self._pending_decision
+                if decision is not None:
+                    return decision
+                await asyncio.sleep(0.05)
+            _logger.warning("[RECV] Accept decision timed out; rejecting")
+            return False
 
         async def on_text(text: str) -> None:
             self.status.emit(f"[TEXT] {text}")
@@ -125,6 +184,7 @@ class ReceiverWorker(QObject):
         async def on_p2p(p2p: P2pInfo) -> None:
             _logger.info("[P2P] SSID=%s port=%s freq=%s", p2p.ssid, p2p.port, p2p.freq)
             self.p2p.emit(p2p.ssid, p2p.psk, p2p.port)
+            self.stage.emit(STAGE_P2P, STAGE_NAMES[STAGE_P2P])
             self.status.emit(f"[WIFI] 连接 {p2p.ssid} ...")
             try:
                 success = await asyncio.get_event_loop().run_in_executor(
@@ -137,6 +197,7 @@ class ReceiverWorker(QObject):
                 success = False
             if success:
                 _logger.info("[WIFI] connected to %s", p2p.ssid)
+                self.stage.emit(STAGE_WIFI, STAGE_NAMES[STAGE_WIFI])
                 self.status.emit("[WIFI] 已连接，等待传输 ...")
                 await asyncio.sleep(2.0)
             else:
@@ -146,9 +207,11 @@ class ReceiverWorker(QObject):
             output_dir=output_dir,
             on_request=on_request,
             on_text=on_text,
+            on_progress=report_progress,
         )
 
         while self._running:
+            self.stage.emit(STAGE_LISTENING, STAGE_NAMES[STAGE_LISTENING])
             self.status.emit(
                 f"[RECV] 监听中：{self._device_name}（广告 + GATT 就绪）"
             )
@@ -173,8 +236,11 @@ class ReceiverWorker(QObject):
             if files:
                 for f in files:
                     self.file_received.emit(f.name, str(f.path), f.size)
+                self.stage.emit(STAGE_DONE, STAGE_NAMES[STAGE_DONE])
                 self.status.emit(f"[RECV] 收到 {len(files)} 个文件")
             else:
+                self.stage.emit(STAGE_LISTENING, STAGE_NAMES[STAGE_LISTENING])
                 self.status.emit("[RECV] 会话结束，继续监听 ...")
 
+        self.stage.emit(STAGE_IDLE, STAGE_NAMES[STAGE_IDLE])
         self.status.emit("[RECV] 已停止")
