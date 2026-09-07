@@ -327,6 +327,15 @@ def _connect_wifi_wpasupplicant(ssid: str, password: str,
         ["sudo", "dhclient", device],
         capture_output=True, text=True, timeout=20,
     )
+
+    # Disable Wi-Fi power save.  wpa_supplicant leaves it ON by default, and
+    # on MediaTek (MT7921) that makes the radio sleep periodically — which
+    # stalls/kills long transfers (~mid-way) that phone-to-phone links handle
+    # fine.  NetworkManager normally turns power save off; we must too.
+    # `wpa_cli SET power_save 0` goes through the already-authorized wpa_cli.
+    _wpa_cli(device, "SET", "power_save", "0")
+    logger.info("[WIFI] Power save disabled on %s", device)
+
     logger.info("[WIFI] ✅ Connected to '%s' via wpa_supplicant", ssid)
     return True
 
