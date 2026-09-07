@@ -19,10 +19,10 @@ class ReceiverWorker(QObject):
 
     # (message)
     status = Signal(str)
-    # (sender_name, file_name, total_size)
-    transfer_started = Signal(str, str, int)
+    # (sender_name, file_name, total_size) — qlonglong (64-bit); file sizes can exceed 2GB
+    transfer_started = Signal(str, str, 'qlonglong')
     # (file_name, file_path, size)
-    file_received = Signal(str, str, int)
+    file_received = Signal(str, str, 'qlonglong')
     # (ssid, psk, port)
     p2p = Signal(str, str, int)
     # (message)
