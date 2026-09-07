@@ -8,7 +8,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from mtapy import MTAReceiver, SendRequest, P2pInfo
 from mtapy.drivers.linux import BlueZBLEProvider
-from mtapy.wifi_helper import connect_to_wifi
+from mtapy.wifi_helper import connect_to_wifi, restore_wifi
 
 
 class ReceiverWorker(QObject):
@@ -142,6 +142,10 @@ class ReceiverWorker(QObject):
                 self.error.emit(str(e))
                 await asyncio.sleep(3)
                 continue
+            finally:
+                # Restore NetworkManager management after a wpa_supplicant
+                # session so the user isn't left without Wi-Fi.
+                restore_wifi()
 
             if files:
                 for f in files:

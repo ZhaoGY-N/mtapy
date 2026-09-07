@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 
 from mtapy import MTAReceiver, SendRequest, P2pInfo
 from mtapy.drivers.linux import BlueZBLEProvider
-from mtapy.wifi_helper import connect_to_wifi
+from mtapy.wifi_helper import connect_to_wifi, restore_wifi
 
 
 async def listen_for_transfers(
@@ -90,6 +90,9 @@ async def listen_for_transfers(
     except Exception as e:
         logger.error("[RECV] ❌ Transfer failed: %s", e)
         files = []
+    finally:
+        # Restore NetworkManager management after a wpa_supplicant session.
+        restore_wifi()
 
     if files:
         logger.info("[RECV] ✅ Success! %s file(s) received.", len(files))

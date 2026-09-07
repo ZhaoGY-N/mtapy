@@ -5,6 +5,7 @@ import sys
 import re
 import glob
 import logging
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -192,6 +193,118 @@ def _get_current_connection(device: str) -> Optional[str]:
     return None
 
 
+def _sudo_available() -> bool:
+    """Check if passwordless sudo works (needed for wpa_supplicant/dhclient)."""
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "true"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _connect_wifi_wpasupplicant(ssid: str, password: str,
+                                bssid: Optional[str], device: str) -> bool:
+    """Connect using wpa_supplicant directly (fast, bypasses NM's scan).
+
+    Requires passwordless sudo for wpa_supplicant/dhclient/wpa_cli/pkill
+    (see the sudoers setup in the README).
+    """
+    config = f'network={{\n    ssid="{ssid}"\n    psk="{password}"\n    key_mgmt=WPA-PSK\n'
+    if bssid:
+        config += f'    bssid={bssid}\n'
+    config += '}\n'
+    Path("/tmp/mtapy_wpa.conf").write_text(config)
+
+    # Stop NetworkManager managing the device (works without root).
+    subprocess.run(
+        ["nmcli", "device", "set", device, "managed", "no"],
+        capture_output=True, text=True, timeout=15,
+    )
+    time.sleep(1)
+
+    # Kill any leftover wpa_supplicant on the device.
+    subprocess.run(
+        ["sudo", "pkill", "-f", f"wpa_supplicant.*{device}"],
+        capture_output=True, text=True, timeout=15,
+    )
+    time.sleep(1)
+
+    # Start our own wpa_supplicant with the DIRECT network.
+    subprocess.run(
+        ["sudo", "wpa_supplicant", "-B", "-i", device, "-c", "/tmp/mtapy_wpa.conf"],
+        capture_output=True, text=True, timeout=15,
+    )
+
+    # Wait for the WPA handshake to complete.
+    for _ in range(30):
+        status = subprocess.run(
+            ["sudo", "wpa_cli", "-i", device, "status"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if "wpa_state=COMPLETED" in status.stdout:
+            break
+        time.sleep(0.5)
+    else:
+        logger.error("[WIFI] wpa_supplicant did not reach COMPLETED")
+        return False
+
+    # Obtain an IP from the phone's P2P group owner.
+    subprocess.run(
+        ["sudo", "dhclient", device],
+        capture_output=True, text=True, timeout=20,
+    )
+    logger.info("[WIFI] ✅ Connected to '%s' via wpa_supplicant", ssid)
+    return True
+
+
+def _find_wifi_device() -> Optional[str]:
+    """Return any Wi-Fi device, regardless of connection state."""
+    try:
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "DEVICE,TYPE", "device", "status"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 2 and parts[1] == "wifi":
+                return parts[0]
+    except Exception:
+        pass
+    return None
+
+
+def restore_wifi(device: Optional[str] = None,
+                 prev_conn: Optional[str] = None) -> None:
+    """Restore NetworkManager management after a wpa_supplicant session."""
+    device = device or _find_wifi_device()
+    if not device:
+        return
+    subprocess.run(
+        ["sudo", "pkill", "-f", f"wpa_supplicant.*{device}"],
+        capture_output=True, text=True, timeout=15,
+    )
+    subprocess.run(
+        ["sudo", "dhclient", "-r", device],
+        capture_output=True, text=True, timeout=15,
+    )
+    subprocess.run(
+        ["nmcli", "device", "set", device, "managed", "yes"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if prev_conn:
+        subprocess.run(
+            ["nmcli", "connection", "up", prev_conn],
+            capture_output=True, text=True, timeout=30,
+        )
+
+
 def _current_freq(device: str) -> Optional[int]:
     """Return the frequency (MHz) the Wi-Fi device is currently on."""
     try:
@@ -231,7 +344,16 @@ def _connect_to_wifi_linux(ssid: str, password: str, bssid: Optional[str] = None
 
     device = _get_wifi_device()
     prev_conn = _get_current_connection(device) if device else None
-    logger.info("[WIFI] 🔄 Connecting to '%s' via nmcli (device=%s)...", ssid, device)
+    logger.info("[WIFI] 🔄 Connecting to '%s' (device=%s)...", ssid, device)
+
+    # Fast path: wpa_supplicant directly (needs passwordless sudo).
+    if device and _sudo_available():
+        logger.info("[WIFI] Trying wpa_supplicant (fast path)...")
+        if _connect_wifi_wpasupplicant(ssid, password, bssid, device):
+            return True
+        logger.warning("[WIFI] wpa_supplicant failed; falling back to nmcli")
+
+    logger.info("[WIFI] Connecting via nmcli...")
 
     deadline = time.time() + 30
     disconnected = False

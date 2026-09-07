@@ -30,6 +30,18 @@ python3 -m venv .venv
 .venv/bin/pip install -e ".[linux]"
 ```
 
+**Fast WiFi path (wpa_supplicant) — optional but recommended for speed:**
+
+```bash
+.venv/bin/pip install -e ".[linux,gui]"
+sudo bash /tmp/setup_mtapy_sudoers.sh
+```
+
+The sudoers setup script is in the repo (`scripts/setup_mtapy_sudoers.sh`); run it once:
+```bash
+sudo bash scripts/setup_mtapy_sudoers.sh
+```
+
 Or install just the needed packages:
 
 ```bash
